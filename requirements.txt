@@ -1,0 +1,23 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn==0.24.0
+streamlit==1.28.1
+python-multipart==0.0.6
+
+# LangChain and AI
+langchain==0.1.0
+langchain-community==0.0.10
+langchain-google-genai==0.0.6
+
+# AI Models
+google-generativeai==0.3.2
+
+# YouTube API and data collection
+google-api-python-client==2.108.0
+
+# Vector stores
+chromadb==0.4.18
+
+# Environment and configuration
+python-dotenv==1.0.0
+pyyaml==6.0.1

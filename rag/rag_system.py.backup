@@ -1,0 +1,255 @@
+from typing import List, Tuple, Optional, Dict
+from rag.embeddings.embedding_manager import EmbeddingManager
+from rag.retrieval.retriever import Retriever
+from rag.generation.generator import OpinionAnalysisGenerator
+from rag.document_processor import CommentProcessor
+from rag.sentiment_analyzer import SentimentAnalyzer
+from app.models.schemas import ChatMessage, CommentData, AnalysisResult, SentimentResult
+
+
+class RAGSystem:
+    """채팅을 위한 기본 RAG 시스템"""
+    
+    def __init__(self):
+        self.embedding_manager = EmbeddingManager()
+        self.retriever = Retriever(self.embedding_manager)
+        self.generator = OpinionAnalysisGenerator()
+    
+    async def generate_response(
+        self, 
+        query: str, 
+        conversation_history: List[ChatMessage] = None
+    ) -> Tuple[str, Optional[List[str]]]:
+        """RAG를 사용한 응답 생성"""
+        try:
+            # 관련 문서 검색
+            relevant_docs = await self.retriever.retrieve(query, top_k=5)
+            
+            # 응답 생성
+            response = await self.generator.generate_simple_response(
+                query=query,
+                context_documents=relevant_docs,
+                conversation_history=conversation_history or []
+            )
+            
+            # 소스 추출
+            sources = [doc.get("metadata", {}).get("video_title", "Unknown") 
+                      for doc in relevant_docs[:3]]
+            
+            return response, sources
+            
+        except Exception as e:
+            return f"응답 생성 중 오류가 발생했습니다: {str(e)}", None
+    
+    async def generate_direct_response(
+        self, 
+        query: str, 
+        conversation_history: List[ChatMessage] = None
+    ) -> str:
+        """RAG 없이 직접 LLM 응답 생성"""
+        try:
+            response = await self.generator.generate_direct_response(
+                query=query,
+                conversation_history=conversation_history or []
+            )
+            return response
+        except Exception as e:
+            return f"응답 생성 중 오류가 발생했습니다: {str(e)}"
+
+
+class OpinionAnalysisRAGSystem:
+    """댓글 기반 여론 분석을 위한 RAG(Retrieval-Augmented Generation) 시스템"""
+    
+    def __init__(self):
+        self.embedding_manager = EmbeddingManager()
+        self.retriever = Retriever(self.embedding_manager)
+        self.generator = OpinionAnalysisGenerator()
+        self.comment_processor = CommentProcessor()
+        self.sentiment_analyzer = SentimentAnalyzer()
+    
+    async def collect_and_analyze_topic(
+        self, 
+        topic: str, 
+        max_videos: int = 10, 
+        max_comments_per_video: int = 100
+    ) -> Dict:
+        """주제별 댓글 수집 및 초기 분석"""
+        
+        # 1. 댓글 수집 및 벡터 저장소에 저장
+        comment_count, processed_count = await self.comment_processor.collect_and_process_comments(
+            topic=topic,
+            max_videos=max_videos,
+            max_comments_per_video=max_comments_per_video
+        )
+        
+        return {
+            "topic": topic,
+            "collected_comments": comment_count,
+            "processed_chunks": processed_count,
+            "status": "completed"
+        }
+    
+    async def analyze_opinion(
+        self, 
+        query: str, 
+        topic: Optional[str] = None,
+        top_k: int = 20,
+        detailed: bool = True
+    ) -> Tuple[str, Dict]:
+        """질문에 대한 여론 분석"""
+        
+        # 1. 관련 댓글 검색
+        relevant_comments = await self.retriever.retrieve(query, top_k=top_k)
+        
+        # 토픽이 지정된 경우 필터링 (메타데이터 기반)
+        if topic:
+            relevant_comments = [
+                comment for comment in relevant_comments 
+                if comment.get("metadata", {}).get("topic") == topic
+            ]
+        
+        # 2. 여론 분석 생성
+        analysis_text, sentiment_stats = await self.generator.generate_opinion_analysis(
+            query=query,
+            relevant_comments=relevant_comments,
+            detailed=detailed
+        )
+        
+        # 3. 대표 댓글 추출
+        representative_comments = self._extract_representative_comments(relevant_comments)
+        
+        # 4. 키워드 추출
+        keywords = self._extract_keywords(relevant_comments)
+        
+        # 5. 결과 통합
+        analysis_result = {
+            "analysis_text": analysis_text,
+            "sentiment_stats": sentiment_stats,
+            "representative_comments": representative_comments,
+            "keywords": keywords,
+            "total_relevant_comments": len(relevant_comments),
+            "query": query,
+            "topic": topic
+        }
+        
+        return analysis_text, analysis_result
+    
+    async def get_topic_overview(self, topic: str) -> Dict:
+        """특정 주제의 전체 개요"""
+        
+        # 주제 관련 통계
+        stats = await self.comment_processor.get_comment_statistics(topic)
+        
+        # 주제 관련 모든 댓글 검색 (넓은 범위)
+        all_comments = await self.retriever.retrieve(topic, top_k=50)
+        
+        # 토픽 필터링
+        topic_comments = [
+            comment for comment in all_comments 
+            if comment.get("metadata", {}).get("topic") == topic
+        ]
+        
+        # 감정 분석
+        comment_texts = []
+        for comment in topic_comments:
+            comment_texts.append({
+                "text": comment.get("content", ""),
+                "author": comment.get("metadata", {}).get("author", ""),
+                "like_count": comment.get("metadata", {}).get("like_count", 0)
+            })
+        
+        sentiment_stats = self.generator._analyze_comment_sentiments(comment_texts)
+        
+        # 주요 키워드
+        keywords = self._extract_keywords(topic_comments)
+        
+        return {
+            "topic": topic,
+            "total_comments": len(topic_comments),
+            "sentiment_overview": sentiment_stats,
+            "top_keywords": keywords[:10],
+            "collection_stats": stats
+        }
+    
+    def _extract_representative_comments(self, comments: List[Dict], max_count: int = 5) -> List[Dict]:
+        """대표적인 댓글들 추출"""
+        if not comments:
+            return []
+        
+        # 좋아요 수와 유사도 점수를 종합하여 정렬
+        scored_comments = []
+        for comment in comments:
+            metadata = comment.get("metadata", {})
+            like_count = metadata.get("like_count", 0)
+            similarity_score = comment.get("score", 0)
+            
+            # 종합 점수 (유사도 70% + 좋아요 30%)
+            combined_score = similarity_score * 0.7 + min(like_count / 100, 1) * 0.3
+            
+            scored_comments.append({
+                "content": comment.get("content", ""),
+                "author": metadata.get("author", "익명"),
+                "like_count": like_count,
+                "video_title": metadata.get("video_title", ""),
+                "score": combined_score,
+                "sentiment_positive": metadata.get("sentiment_positive", 0),
+                "sentiment_negative": metadata.get("sentiment_negative", 0),
+                "sentiment_neutral": metadata.get("sentiment_neutral", 0)
+            })
+        
+        # 점수 순으로 정렬 후 상위 선택
+        scored_comments.sort(key=lambda x: x["score"], reverse=True)
+        return scored_comments[:max_count]
+    
+    def _extract_keywords(self, comments: List[Dict], max_count: int = 15) -> List[str]:
+        """댓글에서 주요 키워드 추출"""
+        if not comments:
+            return []
+        
+        import re
+        from collections import Counter
+        
+        # 모든 댓글 텍스트 수집
+        all_text = []
+        for comment in comments:
+            content = comment.get("content", "")
+            all_text.append(content)
+        
+        # 키워드 추출 (한글 2글자 이상, 영문 3글자 이상)
+        all_words = []
+        for text in all_text:
+            words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{3,}', text)
+            all_words.extend(words)
+        
+        # 불용어 제거
+        stopwords = {
+            "이거", "저거", "그거", "이것", "저것", "그것", "여기", "저기", "거기",
+            "이렇", "저렇", "그렇", "정말", "진짜", "완전", "너무", "엄청", "되게",
+            "그냥", "좀더", "이제", "이미", "아직", "벌써", "한번", "두번", "영상",
+            "댓글", "구독", "좋아요", "채널", "유튜브", "youtube", "like", "subscribe"
+        }
+        
+        filtered_words = [word for word in all_words if word not in stopwords and len(word) > 1]
+        
+        # 빈도수 계산 및 상위 키워드 반환
+        word_counts = Counter(filtered_words)
+        return [word for word, count in word_counts.most_common(max_count)]
+    
+    async def clear_topic_data(self, topic: str):
+        """특정 주제의 모든 데이터 삭제"""
+        await self.comment_processor.delete_comments_by_topic(topic)
+    
+    async def get_system_stats(self) -> Dict:
+        """시스템 전체 통계"""
+        collection_stats = self.retriever.get_collection_stats()
+        
+        return {
+            "total_stored_comments": collection_stats.get("total_documents", 0),
+            "embedding_model": self.embedding_manager.model.model_name if hasattr(self.embedding_manager.model, 'model_name') else "unknown",
+            "vector_store_type": "chromadb",
+            "status": "active"
+        }
+
+
+# 기존 클래스와의 호환성을 위한 별칭
+RAGSystem = OpinionAnalysisRAGSystem 
